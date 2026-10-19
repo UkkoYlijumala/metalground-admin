@@ -7,17 +7,24 @@ const REPO_NAME = 'helsinki-metal-guide';
 const API_FILE_PATH = 'events.json'; 
 const MANUAL_FILE_PATH = 'manual_events.json'; 
 
+interface Lineup {
+  id: string;
+  artist: string;
+  stageTime?: string;
+}
+
 interface Event {
   id: string;
   title: string;
   date: string;
   endTime?: string;
   venue: { name: string; address?: string };
+  lineup?: Lineup[];
   description: string;
   price?: string;
   ticketUrl?: string;
   image?: string;
-  ageLimit?: string;
+  ageLimit?: string | number;
 }
 
 export default function App() {
@@ -148,6 +155,30 @@ export default function App() {
     }
   };
 
+  // --- LINEUP HANDLERS ---
+  const addLineupItem = () => {
+    if (!selectedEvent) return;
+    const currentLineup = selectedEvent.lineup || [];
+    setSelectedEvent({
+      ...selectedEvent,
+      lineup: [...currentLineup, { id: `band-${Date.now()}`, artist: '', stageTime: '' }]
+    });
+  };
+
+  const updateLineupItem = (index: number, field: 'artist' | 'stageTime', value: string) => {
+    if (!selectedEvent || !selectedEvent.lineup) return;
+    const newLineup = [...selectedEvent.lineup];
+    newLineup[index] = { ...newLineup[index], [field]: value };
+    setSelectedEvent({ ...selectedEvent, lineup: newLineup });
+  };
+
+  const removeLineupItem = (index: number) => {
+    if (!selectedEvent || !selectedEvent.lineup) return;
+    const newLineup = selectedEvent.lineup.filter((_, i) => i !== index);
+    setSelectedEvent({ ...selectedEvent, lineup: newLineup });
+  };
+  // -----------------------
+
   const saveLocalEvent = (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedEvent) return;
@@ -177,6 +208,7 @@ export default function App() {
       title: '',
       date: new Date().toISOString(),
       venue: { name: '', address: '' },
+      lineup: [],
       description: '',
       price: '',
       ticketUrl: '',
@@ -288,6 +320,38 @@ export default function App() {
               <input type="text" value={selectedEvent.title || ''} onChange={(e) => handleFormChange('title', e.target.value)} required style={{ padding: '0.5rem', border: '1px solid #ccc', borderRadius: '4px', fontWeight: 'normal' }} />
             </label>
             
+            {/* LINEUP SECTION */}
+            <div style={{ border: '1px solid #ccc', padding: '1rem', borderRadius: '4px', backgroundColor: '#fdfdfd' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+                <strong style={{ fontSize: '0.9rem' }}>Lineup / Warm-up Bands</strong>
+                <button type="button" onClick={addLineupItem} style={{ padding: '0.3rem 0.6rem', fontSize: '0.8rem', cursor: 'pointer', backgroundColor: '#e9ecef', border: '1px solid #ccc', borderRadius: '4px' }}>+ Add Band</button>
+              </div>
+              
+              {(selectedEvent.lineup || []).map((band, index) => (
+                <div key={band.id} style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.5rem', alignItems: 'center' }}>
+                  <input 
+                    type="text" 
+                    placeholder="Artist name" 
+                    value={band.artist} 
+                    onChange={(e) => updateLineupItem(index, 'artist', e.target.value)}
+                    style={{ flex: 2, padding: '0.5rem', border: '1px solid #ccc', borderRadius: '4px' }}
+                    required
+                  />
+                  <input 
+                    type="text" 
+                    placeholder="Time (e.g. 21:00)" 
+                    value={band.stageTime || ''} 
+                    onChange={(e) => updateLineupItem(index, 'stageTime', e.target.value)}
+                    style={{ flex: 1, padding: '0.5rem', border: '1px solid #ccc', borderRadius: '4px' }}
+                  />
+                  <button type="button" onClick={() => removeLineupItem(index)} style={{ padding: '0.5rem', backgroundColor: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>X</button>
+                </div>
+              ))}
+              {(!selectedEvent.lineup || selectedEvent.lineup.length === 0) && (
+                <div style={{ fontSize: '0.85rem', color: '#888', fontStyle: 'italic' }}>No additional bands added yet.</div>
+              )}
+            </div>
+
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
               <label style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', fontWeight: 'bold' }}>
                 Date:
