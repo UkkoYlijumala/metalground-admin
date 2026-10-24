@@ -25,6 +25,7 @@ interface Event {
   ticketUrl?: string;
   image?: string;
   ageLimit?: string | number;
+  addedDate?: string;
 }
 
 export default function App() {
@@ -213,7 +214,8 @@ export default function App() {
       price: '',
       ticketUrl: '',
       image: '',
-      ageLimit: ''
+      ageLimit: '',
+      addedDate: new Date().toISOString()
     });
   };
 
