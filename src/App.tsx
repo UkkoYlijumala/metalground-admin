@@ -221,10 +221,78 @@ function parseEventList(text: string, fileName: string): GigEvent[] {
   throw new Error(`${fileName} does not hold a list of events`);
 }
 
-function describePushError(error: unknown): string {
+// The text of an events file without the events that have one of these ids. The layout of the file (indent, an
+// { events: [...] } wrapper, the final newline) stays as it was, so GitHub shows only the removed events as the change.
+function removeEventsFromJson(text: string, ids: ReadonlySet<string>, fileName: string): { text: string; removed: number } {
+  if (text.trim() === '') return { text, removed: 0 };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`${fileName} is not valid JSON`);
+  }
+  const isListed = (event: unknown): boolean => {
+    if (typeof event !== 'object' || event === null) return false;
+    const id = (event as { id?: unknown }).id;
+    return typeof id === 'string' && ids.has(id);
+  };
+  let output: unknown;
+  let removed = 0;
+  if (Array.isArray(parsed)) {
+    const kept = parsed.filter((event) => !isListed(event));
+    removed = parsed.length - kept.length;
+    output = kept;
+  } else if (typeof parsed === 'object' && parsed !== null && Array.isArray((parsed as { events?: unknown }).events)) {
+    const wrapper = parsed as { events: unknown[] };
+    const kept = wrapper.events.filter((event) => !isListed(event));
+    removed = wrapper.events.length - kept.length;
+    output = { ...wrapper, events: kept };
+  } else {
+    throw new Error(`${fileName} does not hold a list of events`);
+  }
+  if (removed === 0) return { text, removed: 0 };
+  const indent = /^\s*[[{][ \t]*\r?\n([ \t]+)\S/.exec(text);
+  const body = JSON.stringify(output, null, indent ? indent[1] : undefined);
+  return { text: /\n\s*$/.test(text) ? `${body}\n` : body, removed };
+}
+
+// Removes events from events.json. The file is read again right before, so whatever n8n added meanwhile is kept, and
+// when the file changes between that read and the write, the whole step is done once more.
+async function removeFromEventsFile(octokit: Octokit, ids: string[]): Promise<number> {
+  const idSet = new Set(ids);
+  for (let attempt = 1; ; attempt++) {
+    const file = await readRepoFile(octokit, API_FILE_PATH);
+    if (!file) return 0;
+    const result = removeEventsFromJson(file.text, idSet, API_FILE_PATH);
+    if (result.removed === 0) return 0;
+    try {
+      await octokit.rest.repos.createOrUpdateFileContents({
+        owner: REPO_OWNER,
+        repo: REPO_NAME,
+        path: API_FILE_PATH,
+        message: 'Admin Tool: Remove deleted events',
+        content: encodeBase64(result.text),
+        sha: file.sha,
+      });
+      return result.removed;
+    } catch (error) {
+      const status = getStatus(error);
+      if ((status === 409 || status === 422) && attempt < 2) continue;
+      throw error;
+    }
+  }
+}
+
+function countOf(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? '' : 's'}`;
+}
+
+function describePushError(error: unknown, fileName: string): string {
   const status = getStatus(error);
   if (status === 409 || status === 422) {
-    return `${MANUAL_FILE_PATH} was changed on GitHub after you loaded it. Nothing was overwritten. Press Reload to get the latest version (this drops the changes that are not pushed) and make your change again.`;
+    return fileName === MANUAL_FILE_PATH
+      ? `${MANUAL_FILE_PATH} was changed on GitHub after you loaded it. Nothing was overwritten. Press Reload to get the latest version (this drops the changes that are not pushed) and make your change again.`
+      : `${fileName} was changed on GitHub while saving (n8n may be running). Nothing was overwritten. Wait a moment and press Push to GitHub again.`;
   }
   if (status === 401) return 'GitHub did not accept the token. Log out and log in again with a valid token.';
   if (status === 403 || status === 404) {
@@ -264,6 +332,10 @@ export default function App() {
   const [fileSha, setFileSha] = useState('');
   // What manual_events.json held when it was loaded or last pushed, to see if there is something to push
   const [savedManualJson, setSavedManualJson] = useState('[]');
+  // Events that were deleted in this page and are removed from events.json with the next push
+  const [pendingDeletes, setPendingDeletes] = useState<string[]>([]);
+  // True when manual_events.json was pushed but the rebuild was not requested yet, because a later step of that push failed
+  const [rebuildWanted, setRebuildWanted] = useState(false);
   // False when manual_events.json could not be read: pushing then could overwrite it with an incomplete list
   const [canSave, setCanSave] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -288,6 +360,8 @@ export default function App() {
     setIsAuthenticated(false);
     setApiEvents([]);
     setManualEvents([]);
+    setPendingDeletes([]);
+    setRebuildWanted(false);
     setFileSha('');
     setSavedManualJson('[]');
     setCanSave(false);
@@ -301,8 +375,9 @@ export default function App() {
     if (!octokit) return;
     setLoading(true);
     setStatus(null);
+    setPendingDeletes([]);
     try {
-      // events.json: only shown here, never written
+      // events.json: read here; it is only written when events are deleted (see saveToGitHub)
       let apiList: GigEvent[] = [];
       let apiProblem = '';
       try {
@@ -349,22 +424,29 @@ export default function App() {
     if (isAuthenticated) loadAll();
   }, [isAuthenticated, loadAll]);
 
-  // A success message goes away by itself
+  // A success or info message goes away by itself
   useEffect(() => {
-    if (!status || status.kind !== 'success') return undefined;
+    if (!status || status.kind === 'error') return undefined;
     const timer = setTimeout(() => setStatus(null), 8000);
     return () => clearTimeout(timer);
   }, [status]);
 
-  const apiIds = useMemo(() => new Set(apiEvents.map((ev) => ev.id)), [apiEvents]);
+  // The events of events.json, without the ones that were deleted here and wait for the next push
+  const listedApiEvents = useMemo(() => {
+    if (pendingDeletes.length === 0) return apiEvents;
+    const deleted = new Set(pendingDeletes);
+    return apiEvents.filter((ev) => !deleted.has(ev.id));
+  }, [apiEvents, pendingDeletes]);
+
+  const apiIds = useMemo(() => new Set(listedApiEvents.map((ev) => ev.id)), [listedApiEvents]);
   const manualIds = useMemo(() => new Set(manualEvents.map((ev) => ev.id)), [manualEvents]);
 
   const displayEvents = useMemo(() => {
     const eventMap = new Map<string, GigEvent>();
-    apiEvents.forEach((ev) => eventMap.set(ev.id, ev));
+    listedApiEvents.forEach((ev) => eventMap.set(ev.id, ev));
     manualEvents.forEach((ev) => eventMap.set(ev.id, ev));
     return Array.from(eventMap.values()).sort(byDate);
-  }, [apiEvents, manualEvents]);
+  }, [listedApiEvents, manualEvents]);
 
   const visibleEvents = useMemo(() => {
     const needle = search.trim().toLowerCase();
@@ -376,7 +458,8 @@ export default function App() {
     });
   }, [displayEvents, manualIds, search, onlyMine]);
 
-  const hasUnpushedChanges = useMemo(() => JSON.stringify(manualEvents) !== savedManualJson, [manualEvents, savedManualJson]);
+  const manualChanged = useMemo(() => JSON.stringify(manualEvents) !== savedManualJson, [manualEvents, savedManualJson]);
+  const hasUnpushedChanges = manualChanged || pendingDeletes.length > 0;
   const formDirty = selectedEvent !== null && JSON.stringify(selectedEvent) !== selectedBaseline;
 
   // Warn before the tab is closed while there are changes that would be lost
@@ -478,23 +561,46 @@ export default function App() {
     }
     setSaving(true);
     setStatus(null);
+    const done: string[] = [];
+    let step = MANUAL_FILE_PATH;
+    let manualPushed = false;
     try {
-      const json = `${JSON.stringify(manualEvents, null, 2)}\n`;
-      const response = await octokit.rest.repos.createOrUpdateFileContents({
-        owner: REPO_OWNER,
-        repo: REPO_NAME,
-        path: MANUAL_FILE_PATH,
-        message: 'Admin Tool: Update manual events',
-        content: encodeBase64(json),
-        sha: fileSha || undefined,
-      });
-      setFileSha(response.data.content?.sha || '');
-      setSavedManualJson(JSON.stringify(manualEvents));
-      const rebuildNote = triggerRebuild();
-      setStatus({ kind: 'success', text: `Pushed ${manualEvents.length} manual events to GitHub. ${rebuildNote}` });
+      // 1. manual_events.json (only when it changed)
+      if (manualChanged) {
+        const json = `${JSON.stringify(manualEvents, null, 2)}\n`;
+        const response = await octokit.rest.repos.createOrUpdateFileContents({
+          owner: REPO_OWNER,
+          repo: REPO_NAME,
+          path: MANUAL_FILE_PATH,
+          message: 'Admin Tool: Update manual events',
+          content: encodeBase64(json),
+          sha: fileSha || undefined,
+        });
+        setFileSha(response.data.content?.sha || '');
+        setSavedManualJson(JSON.stringify(manualEvents));
+        manualPushed = true;
+        setRebuildWanted(true);
+        done.push(`Pushed ${countOf(manualEvents.length, 'manual event')} to GitHub.`);
+      }
+      // 2. events.json: take out the events that were deleted here
+      if (pendingDeletes.length > 0) {
+        step = API_FILE_PATH;
+        const removed = await removeFromEventsFile(octokit, pendingDeletes);
+        const deleted = new Set(pendingDeletes);
+        setApiEvents((prev) => prev.filter((ev) => !deleted.has(ev.id)));
+        // not simply emptied: an event deleted while this push was running must stay on the list for the next push
+        setPendingDeletes((prev) => prev.filter((id) => !deleted.has(id)));
+        done.push(removed > 0 ? `Removed ${countOf(removed, 'event')} from ${API_FILE_PATH}.` : `The deleted events were already gone from ${API_FILE_PATH}.`);
+      }
+      // Only manual events need a rebuild. After a deletion alone there is nothing to merge, and a rebuild could bring
+      // the deleted event straight back if it also comes from one of the automatic sources.
+      const rebuildNote = manualPushed || rebuildWanted ? triggerRebuild() : 'No rebuild was requested, there was nothing new to merge.';
+      setRebuildWanted(false);
+      setStatus({ kind: 'success', text: `${done.join(' ')} ${rebuildNote}` });
     } catch (error) {
       console.error('Failed to save', error);
-      setStatus({ kind: 'error', text: describePushError(error) });
+      const earlier = manualPushed ? `${done.join(' ')} The deletion from ${API_FILE_PATH} did not go through. ` : '';
+      setStatus({ kind: 'error', text: `${earlier}${describePushError(error, step)}` });
     } finally {
       setSaving(false);
     }
@@ -559,12 +665,34 @@ export default function App() {
     closeForm();
   };
 
-  const deleteLocalEvent = () => {
+  // Takes the event out of the list. What is in events.json goes from there with the next push, together with the copy
+  // in manual_events.json (if there is one).
+  const deleteEvent = () => {
     if (!selectedEvent) return;
-    const question = apiIds.has(selectedEvent.id)
-      ? `Remove your changes to this event? The version in ${API_FILE_PATH} stays.`
-      : `Delete this event from ${MANUAL_FILE_PATH}?`;
-    if (!window.confirm(question)) return;
+    const id = selectedEvent.id;
+    const inApiFile = apiIds.has(id);
+    const inManualFile = manualIds.has(id);
+    if (!inApiFile && !inManualFile) return;
+    // the title as it is in the list, not what may have been typed in the form meanwhile
+    const listed = displayEvents.find((ev) => ev.id === id);
+    const name = (listed && listed.title) || selectedEvent.title || id;
+    const lines = inApiFile
+      ? [`Delete "${name}"?`, `It is removed from ${API_FILE_PATH}${inManualFile ? ` and ${MANUAL_FILE_PATH}` : ''} when you press Push to GitHub.`]
+      : [`Delete "${name}" from ${MANUAL_FILE_PATH}?`, 'This takes effect when you press Push to GitHub.'];
+    if (inApiFile && !id.startsWith('manual-')) {
+      lines.push('If this event comes from an automatic source, n8n may add it again on a later run.');
+    }
+    if (!window.confirm(lines.join('\n\n'))) return;
+    setManualEvents((prev) => prev.filter((ev) => ev.id !== id));
+    if (inApiFile) setPendingDeletes((prev) => (prev.includes(id) ? prev : [...prev, id]));
+    closeForm();
+    setStatus({ kind: 'info', text: `Deleted "${name}" from the list. Press Push to GitHub to make it final.` });
+  };
+
+  // Only for an event that exists in events.json too: go back to that version
+  const removeMyChanges = () => {
+    if (!selectedEvent) return;
+    if (!window.confirm(`Remove your changes to this event? The version in ${API_FILE_PATH} stays.`)) return;
     const id = selectedEvent.id;
     setManualEvents((prev) => prev.filter((ev) => ev.id !== id));
     closeForm();
@@ -807,11 +935,23 @@ export default function App() {
                   Cancel
                 </button>
               </div>
-              {selectedIsManual && (
-                <button type="button" onClick={deleteLocalEvent} style={{ padding: '0.5rem 1rem', backgroundColor: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
-                  {selectedInApi ? 'Remove My Changes' : 'Delete Event'}
-                </button>
-              )}
+              <div style={{ display: 'flex', gap: '1rem' }}>
+                {selectedIsManual && selectedInApi && (
+                  <button
+                    type="button"
+                    onClick={removeMyChanges}
+                    title={`Go back to the version in ${API_FILE_PATH}`}
+                    style={{ padding: '0.5rem 1rem', backgroundColor: 'white', color: '#dc3545', border: '1px solid #dc3545', borderRadius: '4px', cursor: 'pointer' }}
+                  >
+                    Remove My Changes
+                  </button>
+                )}
+                {(selectedIsManual || selectedInApi) && (
+                  <button type="button" onClick={deleteEvent} style={{ padding: '0.5rem 1rem', backgroundColor: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
+                    Delete Event
+                  </button>
+                )}
+              </div>
             </div>
           </form>
         ) : (
