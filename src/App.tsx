@@ -17,6 +17,9 @@ interface Lineup {
   id: string;
   artist: string;
   stageTime?: string;
+  previewUrl?: string | null;
+  appleMusicUrl?: string | null;
+  previewCheckedAt?: string;
 }
 
 interface GigEvent {
@@ -619,8 +622,15 @@ export default function App() {
 
   const updateLineupItem = (index: number, field: 'artist' | 'stageTime', value: string) => {
     if (!selectedEvent || !selectedEvent.lineup) return;
+    const renamed = field === 'artist' && value !== selectedEvent.lineup[index].artist;
     const newLineup = [...selectedEvent.lineup];
     newLineup[index] = { ...newLineup[index], [field]: value };
+    if (renamed) {
+      // The Apple link belongs to the old name. Without it, n8n looks the new name up again on its next run.
+      delete newLineup[index].previewUrl;
+      delete newLineup[index].appleMusicUrl;
+      delete newLineup[index].previewCheckedAt;
+    }
     updateEvent({ lineup: newLineup });
   };
 
